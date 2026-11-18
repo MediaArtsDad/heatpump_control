@@ -1,0 +1,19 @@
+# KiCad
+*.kicad_prl
+*-backups/
+*.bak
+*.lck
+fp-info-cache
+_autosave-*
+# Arduino / build
+build/
+*.hex
+*.elf
+# Secrets (none today; future WiFi/MQTT creds go here)
+secrets.h
+arduino_secrets.h
+.env
+# OS / editor
+.DS_Store
+*~
+.vscode/

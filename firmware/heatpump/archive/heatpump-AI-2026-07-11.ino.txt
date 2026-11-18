@@ -1,0 +1,337 @@
+#include "Relay.h"
+#include <OneWire.h> // https://lastminuteengineers.com/multiple-ds18b20-arduino-tutorial/#:~:text=Finally%2C%20we%20use%20a%20simple%20for%20loop%20to,to%20all%20the%20sensors%20for%20temperature%20conversion%20sensors.requestTemperatures%28%29%3B
+#include <DallasTemperature.h> // https://arduinogetstarted.com/tutorials/arduino-temperature-sensor
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+
+Relay intpump(2, true),extpump(3,true),heatpump(4,true),emergency(5,true),ext_emergency(6,true); // Relay setup (pin, isNormallyOpen)
+int HEAT1 = 11,HEAT2 = 12,EXTCALL = 8,EXTEMERG = 9;  //name input pins
+const int32_t tArraySize = 16; //array size for temperatures
+int tArray[tArraySize]; // legacy display array, kept in sync from the named floats below -- no longer used to decide which sensor is which
+float TANK_TOP_C_t0,TANK_BOTTOM_C_t1,EXT_IN_C_t2,INT_OUT_C_t3; // temperatures in Celsius, position in array
+float TANK_TOP_F_t4,TANK_BOTTOM_F_t5,EXT_IN_F_t6,INT_OUT_F_t7; // temperatures in Fahrenheigt, position in array
+
+//Setup Onewire instance
+#define T_BUS 10 // One wire bus
+OneWire tempbus(T_BUS);
+DallasTemperature sensors(&tempbus); // share onewire with Dallas Temp
+int sensorcount = 0;
+
+//initialize the liquid crystal library - https://projecthub.arduino.cc/arduino_uno_guy/i2c-liquid-crystal-displays-5eb615
+//the first parameter is  the I2C address
+//the second parameter is how many rows are on your screen
+//the  third parameter is how many columns are on your screen
+LiquidCrystal_I2C lcd(0x27,  20, 4);
+
+// ---- DS18B20 sensor identification by ROM address ----
+// Reading sensors by bus-scan order (old behavior) isn't reliable -- discovery
+// order can change if a sensor is replaced or the bus is rescanned, and this
+// firmware makes heating decisions off those readings. Identify sensors by
+// their unique 64-bit address instead:
+//   1. Set SENSOR_DISCOVERY_MODE to true below, flash, open Serial Monitor @ 9600.
+//   2. Copy each printed address into the matching *_ADDR array below (warm/cool
+//      one sensor at a time to tell which physical sensor is which).
+//   3. Set SENSOR_DISCOVERY_MODE back to false and reflash.
+// Until an address is filled in, that sensor reads as "disconnected"
+// (DEVICE_DISCONNECTED_C, -127) rather than silently reading the wrong
+// physical sensor -- watch the Serial monitor for WARNING lines, and note
+// that loop() deliberately holds its current relay state instead of acting
+// on a disconnected reading.
+#define SENSOR_DISCOVERY_MODE false
+
+DeviceAddress TANK_TOP_ADDR    = {0,0,0,0,0,0,0,0}; // TODO: fill in from discovery output
+DeviceAddress TANK_BOTTOM_ADDR = {0,0,0,0,0,0,0,0}; // TODO: fill in from discovery output
+DeviceAddress EXT_IN_ADDR      = {0,0,0,0,0,0,0,0}; // TODO: fill in from discovery output
+DeviceAddress INT_OUT_ADDR     = {0,0,0,0,0,0,0,0}; // TODO: fill in from discovery output
+
+// ---- Timing / thresholds ----
+// Minimum time the heat pump compressor must stay off before it's allowed to
+// restart, to protect it from short-cycling damage. Side effect: since the
+// timer initializes as if the compressor just turned off, this also enforces
+// a 5-minute delay before the compressor can start after power-up or a
+// reset. Confirm that's acceptable (e.g. after a brownout during an active
+// heat call, you'll wait up to 5 minutes before the compressor resumes).
+const unsigned long COMPRESSOR_MIN_OFF_MS = 5UL * 60UL * 1000UL; // 5 minutes
+
+// How long to keep the exterior pump running after the system stops calling
+// for heat, so it doesn't cut water flow while the compressor(s) are still
+// winding down. Note: now that EXTCALL (the heat pump's own demand for the
+// glycol pump) is wired into the logic below, this timer only matters as a
+// fallback after BOTH the thermostat heat call and EXTCALL have dropped.
+const unsigned long EXTPUMP_COOLDOWN_MS = 60UL * 1000UL; // 60 seconds
+
+// How often a new temperature conversion is started / display refreshed.
+const unsigned long SENSOR_UPDATE_INTERVAL_MS = 1000UL; // 1 second
+
+// Stage-2 (auxiliary/emergency) heat thresholds, tank top temp in Fahrenheit.
+// ASSUMPTION -- please confirm: "calling for stage II" = HEAT2 input HIGH;
+// turn aux heat ON below STAGE2_HEAT_ON_F, OFF at/above STAGE2_HEAT_OFF_F,
+// and hold whatever state it's already in when the reading is in between
+// (hysteresis, so it doesn't chatter right at a single setpoint). This is my
+// best reading of the original commented-out pseudocode -- double-check it
+// matches what you actually want stage 2 to do.
+const float STAGE2_HEAT_ON_F  = 120.0;
+const float STAGE2_HEAT_OFF_F = 130.0;
+
+// ---- State machine (replaces the old blocking while-loops) ----
+enum SystemState { STATE_HEATING, STATE_COOLDOWN, STATE_IDLE };
+SystemState currentState = STATE_IDLE;
+
+unsigned long lastHeatpumpOffTime = 0; // millis() timestamp; see COMPRESSOR_MIN_OFF_MS note above
+unsigned long extpumpCooldownStart = 0;
+
+// ---- Non-blocking DS18B20 conversion tracking ----
+// With setWaitForConversion(false), requestTemperatures() just kicks off a
+// conversion on every sensor and returns immediately instead of sitting in a
+// busy-wait for ~750 ms (12-bit resolution). We note when the request was
+// issued and only read the scratchpads once the conversion time has elapsed.
+bool conversionInProgress = false;
+unsigned long conversionStart = 0;
+unsigned long lastConversionRequest = 0;
+uint16_t conversionTimeMs = 750; // recalculated in setup() from actual resolution
+
+void setup() {
+  Serial.begin(9600);
+
+  // Each relay needs its own statement -- the previous version chained these
+  // with commas, which happens to still call every .begin() here, but is
+  // fragile and easy to break.
+  intpump.begin();
+  extpump.begin();
+  heatpump.begin();
+  emergency.begin();
+  ext_emergency.begin();
+
+  // Each pin needs its own pinMode() call. The previous comma-operator
+  // version only actually set HEAT1 -- HEAT2, EXTCALL, and EXTEMERG were
+  // silently left unconfigured (harmless only because INPUT is the AVR
+  // power-on default).
+  pinMode(HEAT1, INPUT);
+  pinMode(HEAT2, INPUT);
+  pinMode(EXTCALL, INPUT);
+  pinMode(EXTEMERG, INPUT);
+
+  // Initialize OneWire bus
+  sensors.begin();  // initialize temp sensers
+  sensorcount = sensors.getDeviceCount(); //Get number of sensors on bus
+
+  // Non-blocking mode: requestTemperatures() returns immediately instead of
+  // blocking loop() for the whole conversion (~750 ms at 12-bit). loop()
+  // tracks the conversion time itself and reads results when they're ready.
+  sensors.setWaitForConversion(false);
+  conversionTimeMs = sensors.millisToWaitForConversion(sensors.getResolution());
+
+#if SENSOR_DISCOVERY_MODE
+  discoverSensors();
+#endif
+
+  //initialize lcd screen
+  lcd.init();
+  lcd.clear();
+  // turn on the backlight
+  lcd.backlight();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ---- Non-blocking temperature updates ----
+  // Phase 1: kick off a conversion on an interval. Returns immediately.
+  if (!conversionInProgress && (now - lastConversionRequest >= SENSOR_UPDATE_INTERVAL_MS)) {
+    sensors.requestTemperatures(); // non-blocking (setWaitForConversion(false))
+    conversionStart = now;
+    lastConversionRequest = now;
+    conversionInProgress = true;
+  }
+  // Phase 2: once the conversion time has elapsed, read the results.
+  // (Reading 4 scratchpads still costs a few tens of ms of OneWire traffic
+  // once per second -- fine; the ~750 ms busy-wait is what's gone.)
+  if (conversionInProgress && (now - conversionStart >= conversionTimeMs)) {
+    conversionInProgress = false;
+    readtemps();
+    display();
+  }
+
+  // ---- Inputs ----
+  bool callingForHeat = (digitalRead(HEAT1) == HIGH);
+  // EXTCALL: the heat pump compressor's own call for the external water pump
+  // (glycol loop). The glycol pump must run whenever the compressor demands
+  // flow, even if the thermostat heat call has already dropped.
+  bool extPumpCall = (digitalRead(EXTCALL) == HIGH);
+  // EXTEMERG: the heat pump compressor's call for Emergency Backup Heat.
+  bool extEmergCall = (digitalRead(EXTEMERG) == HIGH);
+
+  // ---- Emergency backup heat (compressor-commanded) ----
+  // The ext_emergency relay simply follows the compressor's EXTEMERG call:
+  // the heat pump itself decides when it needs backup heat (e.g. defrost or
+  // low ambient lockout), so we don't gate this on the thermostat.
+  if (extEmergCall) {
+    ext_emergency.turnOn();
+  } else {
+    ext_emergency.turnOff();
+  }
+
+  // ---- Heat call: compressor, interior pump, stage-2 aux ----
+  if (callingForHeat) {
+    bool compressorReady = (now - lastHeatpumpOffTime >= COMPRESSOR_MIN_OFF_MS);
+    if (compressorReady) {
+      heatpump.turnOn();
+    }
+    // else: still inside the mandatory off-time -- extpump runs alone until
+    // it's safe to start the compressor again.
+
+    if (TANK_TOP_C_t0 != DEVICE_DISCONNECTED_C && TANK_TOP_C_t0 > 50) {
+      intpump.turnOn();
+    }
+
+    // Stage 2 / auxiliary heat. ASSUMPTION: "calling for stage II" = HEAT2
+    // input HIGH -- confirm this matches your thermostat wiring.
+    bool callingForStage2 = (digitalRead(HEAT2) == HIGH);
+    if (callingForStage2) {
+      if (TANK_TOP_C_t0 != DEVICE_DISCONNECTED_C) {
+        if (TANK_TOP_F_t4 < STAGE2_HEAT_ON_F) {
+          emergency.turnOn();
+        } else if (TANK_TOP_F_t4 >= STAGE2_HEAT_OFF_F) {
+          emergency.turnOff();
+        }
+        // else: between thresholds -- hold current state (hysteresis)
+      }
+      // else: TANK_TOP sensor not configured/responding -- hold current
+      // state rather than guess; see the WARNING printed by readtemps().
+    } else {
+      emergency.turnOff();
+    }
+
+  } else {
+    // Not calling for heat.
+    if (heatpump.getState() == true) {
+      // Compressor is being commanded off right now -- start the
+      // mandatory-off timer from this moment, not from whenever we happen
+      // to notice it's off again on a later pass.
+      lastHeatpumpOffTime = now;
+    }
+    emergency.turnOff();
+    heatpump.turnOff();
+    intpump.turnOff();
+  }
+
+  // ---- External (glycol) pump ----
+  // Runs whenever the thermostat calls for heat OR the compressor itself
+  // asserts EXTCALL. The compressor's call takes priority over the cooldown
+  // timer: as long as EXTCALL is HIGH the pump stays on, and the 60-second
+  // cooldown only starts once BOTH demands have dropped.
+  bool glycolDemand = callingForHeat || extPumpCall;
+
+  if (glycolDemand) {
+    extpump.turnOn();
+    currentState = STATE_HEATING;
+  } else if (extpump.getState() == true) {
+    if (currentState != STATE_COOLDOWN) {
+      // Just transitioned out of active demand -- start the ext pump
+      // cooldown timer instead of blocking here with delay(60000) like the
+      // original version (a renewed heat call or EXTCALL during the minute
+      // is still caught, since demand is re-checked every pass).
+      extpumpCooldownStart = now;
+      currentState = STATE_COOLDOWN;
+    } else if (now - extpumpCooldownStart >= EXTPUMP_COOLDOWN_MS) {
+      extpump.turnOff();
+      currentState = STATE_IDLE;
+    }
+  } else {
+    currentState = STATE_IDLE;
+  }
+}
+
+void readtemps() { // reads results of an already-completed conversion; the
+                   // request itself is issued non-blocking from loop().
+  TANK_TOP_C_t0    = sensors.getTempC(TANK_TOP_ADDR);
+  TANK_BOTTOM_C_t1 = sensors.getTempC(TANK_BOTTOM_ADDR);
+  EXT_IN_C_t2      = sensors.getTempC(EXT_IN_ADDR);
+  INT_OUT_C_t3     = sensors.getTempC(INT_OUT_ADDR);
+
+  TANK_TOP_F_t4    = DallasTemperature::toFahrenheit(TANK_TOP_C_t0);
+  TANK_BOTTOM_F_t5 = DallasTemperature::toFahrenheit(TANK_BOTTOM_C_t1);
+  EXT_IN_F_t6      = DallasTemperature::toFahrenheit(EXT_IN_C_t2);
+  INT_OUT_F_t7    = DallasTemperature::toFahrenheit(INT_OUT_C_t3);
+
+  // Kept in sync (rounded) purely so display() keeps working; no longer used
+  // to decide which sensor is which -- that's done by ROM address above.
+  tArray[0] = round(TANK_TOP_C_t0);
+  tArray[1] = round(TANK_BOTTOM_C_t1);
+  tArray[2] = round(EXT_IN_C_t2);
+  tArray[3] = round(INT_OUT_C_t3);
+
+  // DEVICE_DISCONNECTED_C (-127) means that named address hasn't been filled
+  // in yet (see the *_ADDR TODOs near the top) or the sensor isn't
+  // responding. loop() checks for this and holds its current relay state
+  // rather than acting on a bogus reading -- but check here if temps look
+  // wrong on the display.
+  if (TANK_TOP_C_t0 == DEVICE_DISCONNECTED_C)    Serial.println(F("WARNING: TANK_TOP sensor not responding -- check TANK_TOP_ADDR"));
+  if (TANK_BOTTOM_C_t1 == DEVICE_DISCONNECTED_C) Serial.println(F("WARNING: TANK_BOTTOM sensor not responding -- check TANK_BOTTOM_ADDR"));
+  if (EXT_IN_C_t2 == DEVICE_DISCONNECTED_C)      Serial.println(F("WARNING: EXT_IN sensor not responding -- check EXT_IN_ADDR"));
+  if (INT_OUT_C_t3 == DEVICE_DISCONNECTED_C)     Serial.println(F("WARNING: INT_OUT sensor not responding -- check INT_OUT_ADDR"));
+}
+
+void display(){
+  // Previous version built each line with "literal" + int + char + char,
+  // which in C++ is pointer arithmetic on the string literal, not string
+  // concatenation -- it produced a garbage pointer instead of text. Fixed
+  // by printing each piece separately. Also fixed: every line was reading
+  // tArray[1]; now each line reads its own index, matching the order the
+  // named temperature variables were declared in (0=tank top, 1=tank
+  // bottom, 2=ext in, 3=int out).
+  lcd.setCursor(0,0);
+  lcd.print("TT ");
+  lcd.print(tArray[0]);
+  lcd.print((char)176); // degree symbol -- verify against your LCD's character ROM; some HD44780 variants use 0xDF (223) instead
+  lcd.print("C");
+  lcd.setCursor(0,1);
+  lcd.print("TB ");
+  lcd.print(tArray[1]);
+  lcd.print((char)176);
+  lcd.print("C");
+  lcd.setCursor(9,0);
+  lcd.print("IN ");
+  lcd.print(tArray[2]);
+  lcd.print((char)176);
+  lcd.print("C");
+  lcd.setCursor(9,1);
+  lcd.print("OUT ");
+  lcd.print(tArray[3]);
+  lcd.print((char)176);
+  lcd.print("C");
+  lcd.setCursor(0,2);
+  lcd.print("INT: ");
+  lcd.setCursor(0,3);
+  lcd.print("EXT: ");
+  lcd.setCursor(9,2);
+  lcd.print("Stat: ");
+  lcd.setCursor(9,3);
+  lcd.print("Mode: ");
+  return;
+}
+
+void printAddress(DeviceAddress addr) {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (addr[i] < 16) Serial.print('0');
+    Serial.print(addr[i], HEX);
+    if (i < 7) Serial.print(' ');
+  }
+}
+
+void discoverSensors() {
+  Serial.print(F("Found "));
+  Serial.print(sensorcount);
+  Serial.println(F(" DS18B20 sensor(s) on the bus:"));
+  DeviceAddress addr;
+  for (int i = 0; i < sensorcount; i++) {
+    if (sensors.getAddress(addr, i)) {
+      Serial.print(F("  Sensor "));
+      Serial.print(i);
+      Serial.print(F(": "));
+      printAddress(addr);
+      Serial.println();
+    }
+  }
+  Serial.println(F("Copy the address(es) above into the *_ADDR arrays near the top of this file. Warm/cool one sensor at a time (e.g. hold it in your hand) and re-run discovery to tell which physical sensor is which."));
+}

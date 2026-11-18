@@ -1,0 +1,109 @@
+#include "Relay.h"
+#include <OneWire.h> // https://lastminuteengineers.com/multiple-ds18b20-arduino-tutorial/#:~:text=Finally%2C%20we%20use%20a%20simple%20for%20loop%20to,to%20all%20the%20sensors%20for%20temperature%20conversion%20sensors.requestTemperatures%28%29%3B
+#include <DallasTemperature.h> // https://arduinogetstarted.com/tutorials/arduino-temperature-sensor
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+
+Relay intpump(2, true),extpump(3,true),heatpump(4,true),emergency(5,true),ext_emergency(6,true); // Relay setup (pin, isNormallyOpen)
+int HEAT1 = 11,HEAT2 = 12,EXTCALL = 8,EXTEMERG = 9;  //name input pins
+const int32_t tArraySize = 16; //array size for temperatures
+int tArray[tArraySize]; // create array for temps, see below for index
+float TANK_TOP_C_t0,TANK_BOTTOM_C_t1,EXT_IN_C_t2,INT_OUT_C_t3; // temperatures in Celsius, position in array
+float TANK_TOP_F_t4,TANK_BOTTOM_F_t5,EXT_IN_F_t6,INT_OUT_F_t7; // temperatures in Fahrenheigt, position in array
+
+//Setup Onewire instance
+#define T_BUS 10 // One wire bus
+OneWire tempbus(T_BUS);
+DallasTemperature sensors(&tempbus); // share onewire with Dallas Temp
+int sensorcount = 0;
+
+//initialize the liquid crystal library - https://projecthub.arduino.cc/arduino_uno_guy/i2c-liquid-crystal-displays-5eb615
+//the first parameter is  the I2C address
+//the second parameter is how many rows are on your screen
+//the  third parameter is how many columns are on your screen
+LiquidCrystal_I2C lcd(0x27,  20, 4);
+
+void setup() {
+  intpump.begin(),extpump.begin(),heatpump.begin(),emergency.begin();  // relay initial states
+  pinMode(HEAT1, INPUT),(HEAT2, INPUT),(EXTCALL, INPUT),(EXTEMERG, INPUT);   // initial input states
+
+  // Initialize OneWire bus
+  sensors.begin();  // initialize temp sensers
+  sensorcount = sensors.getDeviceCount(); //Get number of sensors on bus
+
+  //initialize lcd screen
+  lcd.init();
+  lcd.clear();
+  // turn on the backlight
+  lcd.backlight();
+}
+
+void loop() {
+  measuretemps();
+  display();
+  while (digitalRead(HEAT1) == true){ // While system calling for heat
+    measuretemps();
+    display();
+    extpump.turnOn();
+    heatpump.turnOn();
+    if (tArray[0] > 50) {
+      intpump.turnOn();
+      }
+    delay(1000);
+  }
+    /*
+    //if system is calling for stage II
+      //If tank temp <120
+      emergency.turnOn();
+      //else if temp <130
+      emergency.turnOff();
+    //else systen is not calling for stage II
+      emergency.turnOff(); */
+
+  while (digitalRead(HEAT1) == false){// While system is not calling for heat
+    emergency.turnOff();
+    heatpump.turnOff();
+    intpump.turnOff();
+    display();
+    measuretemps();
+    if (extpump.getState() == true) { // Delays turning off ext pump while compressors shut down. Replace with pump sensor from HP when available
+      delay(60000);
+      extpump.turnOff();
+      }
+    delay(1000);
+  }
+    /*
+    // If intemp < tanktemp
+      extpump.turnOff();
+      */
+  delay(1000);
+}
+
+void measuretemps( ) { //https://forum.arduino.cc/t/returning-an-array/529726/9
+    sensors.requestTemperatures();
+    for (int i = 0; i < sensorcount; i++){
+      tArray[i] = sensors.getTempCByIndex(i);
+      tArray[i + sensorcount] = DallasTemperature::toFahrenheit(tArray[i]);
+    }
+  return;
+}
+
+void display(){
+  lcd.setCursor(0,0);
+  lcd.print("TT " + tArray[1] + 'C' + (char)176);
+  lcd.setCursor(0,1);
+  lcd.print("TB " + tArray[1] + 'C' + (char)176);
+  lcd.setCursor(9,0);
+  lcd.print("IN " + tArray[1] + 'C' + (char)176);
+  lcd.setCursor(9,1);
+  lcd.print("OUT " + tArray[1] + 'C' + (char)176);
+  lcd.setCursor(0,2);
+  lcd.print("INT: ");
+  lcd.setCursor(0,3);
+  lcd.print("EXT: ");
+  lcd.setCursor(9,2);
+  lcd.print("Stat: ");
+  lcd.setCursor(9,3);
+  lcd.print("Mode: ");
+  return;
+}
