@@ -9,6 +9,9 @@ Arduino Uno R3 controller for an air-to-water heat pump + buffer tank system: it
 | Make | MACON |
 | Model | **MAHRW030ZA/(BEH2)** (also written MAHRW030ZAS(BEH2)) |
 | Type | EVI DC inverter high-temperature air-to-water heat pump, 240V / 1PH / 60Hz |
+| Related brand | Arctic Heat Pumps (rebrands MACON units) |
+
+**Note on Arctic Heat Pumps:** Arctic sells rebranded MACON units, but this one was a custom spec ordered direct. It doesn't match any Arctic model 1:1, so Arctic's documentation is only a rough guide for it.
 
 The controller works alongside the unit's own wired control panel: it switches the unit's heat-enable input and the circulation pumps, and it manages a buffer tank with resistive backup elements. If you have a MACON MAHRW-series unit (or a similar EVI air-to-water heat pump) and want external Arduino control, this may be a useful starting point.
 
