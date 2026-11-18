@@ -2,6 +2,16 @@
 
 Arduino Uno R3 controller for an air-to-water heat pump + buffer tank system: it reads DS18B20 tank/loop temperatures and thermostat call inputs, then drives a LOW-trigger relay board (interior pump, exterior pump, compressor enable, tank elements), with min-run/min-off timers, a software tank high-limit, a watchdog, and a 20x4 I2C LCD status display.
 
+## Heat pump
+
+| | |
+|---|---|
+| Make | MACON |
+| Model | **MAHRW030ZA/(BEH2)** (also written MAHRW030ZAS(BEH2)) |
+| Type | EVI DC inverter high-temperature air-to-water heat pump, 240V / 1PH / 60Hz |
+
+The controller works alongside the unit's own wired control panel: it switches the unit's heat-enable input and the circulation pumps, and it manages a buffer tank with resistive backup elements. If you have a MACON MAHRW-series unit (or a similar EVI air-to-water heat pump) and want external Arduino control, this may be a useful starting point.
+
 ## Layout
 
 | Path | What |
