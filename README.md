@@ -20,7 +20,6 @@ Libraries (Arduino Library Manager):
 - OneWire 2.3.8
 - DallasTemperature 4.0.6
 - LiquidCrystal I2C 1.1.2
-- Sodaq_wdt 1.0.2
 
 ```
 arduino-cli compile --fqbn arduino:avr:uno firmware/heatpump
